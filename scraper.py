@@ -217,5 +217,23 @@ def scrape_all():
     with open(TRENDS_CACHE_FILE, 'w') as f: json.dump(cache, f, indent=2)
     print(f"Cycle complete: {datetime.now()}")
 
+def main():
+    global ELECTION_URL_PREFIX
+    while True:
+        prefix = os.getenv("ELECTION_URL_PREFIX")
+        if not prefix:
+            print(f"[{datetime.now()}] ELECTION_URL_PREFIX not provided. Waiting...")
+            time.sleep(60)
+            continue
+        
+        ELECTION_URL_PREFIX = prefix
+        try:
+            scrape_all()
+        except Exception as e:
+            print(f"Error during scrape: {e}")
+            
+        print(f"[{datetime.now()}] Cycle complete. Sleeping for 10 minutes...")
+        time.sleep(600)
+
 if __name__ == "__main__":
-    scrape_all()
+    main()
