@@ -1,0 +1,22 @@
+services:
+  - type: cron
+    name: eci-scraper
+    runtime: python
+    schedule: "*/10 * * * *" # Runs every 10 minutes
+    buildCommand: pip install -r requirements.txt
+    startCommand: python scraper.py
+    envVars:
+      - key: ELECTION_URL_PREFIX
+        sync: false
+      - key: ELECTION_ID
+        sync: false
+      - key: R2_ACCOUNT_ID
+        sync: false
+      - key: R2_ACCESS_KEY_ID
+        sync: false
+      - key: R2_SECRET_ACCESS_KEY
+        sync: false
+      - key: R2_BUCKET_NAME
+        sync: false
+      - key: DELAY_BETWEEN_REQUESTS
+        default: "1.0"
