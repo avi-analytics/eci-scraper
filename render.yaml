@@ -1,10 +1,9 @@
 services:
-  - type: cron
+  - type: worker
     name: eci-scraper
     runtime: python
-    schedule: "*/10 * * * *" # Runs every 10 minutes
     buildCommand: pip install -r requirements.txt
-    startCommand: if [ -n "$ELECTION_URL_PREFIX" ]; then python scraper.py; else echo "ELECTION_URL_PREFIX not provided. Skipping run."; fi
+    startCommand: python scraper.py
     envVars:
       - key: ELECTION_URL_PREFIX
         sync: false
