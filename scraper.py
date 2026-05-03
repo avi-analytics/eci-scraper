@@ -14,22 +14,14 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# --- CONFIGURATION ---
-ELECTION_URL_PREFIX = os.getenv("ELECTION_URL_PREFIX")
-if not ELECTION_URL_PREFIX:
-    print("ELECTION_URL_PREFIX not provided. Exiting.")
-    import sys
-    sys.exit(0)
-
-ELECTION_ID = os.getenv("ELECTION_ID", "2026_RESULTS")
-
-R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID")
-R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID")
-R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY")
-R2_BUCKET_NAME = os.getenv("R2_BUCKET_NAME")
-R2_ENDPOINT_URL = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com" if R2_ACCOUNT_ID else None
-
-DELAY_BETWEEN_REQUESTS = float(os.getenv("DELAY_BETWEEN_REQUESTS", "1.0"))
+# --- CONFIGURATION (Globals updated in main) ---
+ELECTION_URL_PREFIX = None
+ELECTION_ID = "2026_RESULTS"
+R2_ACCOUNT_ID = None
+R2_ACCESS_KEY_ID = None
+R2_SECRET_ACCESS_KEY = None
+R2_BUCKET_NAME = None
+R2_ENDPOINT_URL = None
 
 STATE_CONFIG = {
     "West Bengal": {"code": "S25", "count": 294, "trend_pages": 30},
@@ -46,6 +38,20 @@ TRENDS_CACHE_FILE = CACHE_DIR / "trends_cache.json"
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
 }
+
+DELAY_BETWEEN_REQUESTS = 1.0
+
+def update_config():
+    global ELECTION_URL_PREFIX, ELECTION_ID, R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME, R2_ENDPOINT_URL, DELAY_BETWEEN_REQUESTS
+    load_dotenv(override=True)
+    ELECTION_URL_PREFIX = os.getenv("ELECTION_URL_PREFIX")
+    ELECTION_ID = os.getenv("ELECTION_ID", "2026_RESULTS")
+    R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID")
+    R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID")
+    R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY")
+    R2_BUCKET_NAME = os.getenv("R2_BUCKET_NAME")
+    R2_ENDPOINT_URL = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com" if R2_ACCOUNT_ID else None
+    DELAY_BETWEEN_REQUESTS = float(os.getenv("DELAY_BETWEEN_REQUESTS", "1.0"))
 
 def get_r2_client():
     if not all([R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY]):
@@ -218,15 +224,13 @@ def scrape_all():
     print(f"Cycle complete: {datetime.now()}")
 
 def main():
-    global ELECTION_URL_PREFIX
     while True:
-        prefix = os.getenv("ELECTION_URL_PREFIX")
-        if not prefix:
+        update_config()
+        if not ELECTION_URL_PREFIX:
             print(f"[{datetime.now()}] ELECTION_URL_PREFIX not provided. Waiting...")
             time.sleep(60)
             continue
         
-        ELECTION_URL_PREFIX = prefix
         try:
             scrape_all()
         except Exception as e:
