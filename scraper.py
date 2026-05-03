@@ -15,7 +15,12 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # --- CONFIGURATION ---
-ELECTION_URL_PREFIX = os.getenv("ELECTION_URL_PREFIX", "PcResultGenJune2024")
+ELECTION_URL_PREFIX = os.getenv("ELECTION_URL_PREFIX")
+if not ELECTION_URL_PREFIX:
+    print("ELECTION_URL_PREFIX not provided. Exiting.")
+    import sys
+    sys.exit(0)
+
 ELECTION_ID = os.getenv("ELECTION_ID", "2026_RESULTS")
 
 R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID")
