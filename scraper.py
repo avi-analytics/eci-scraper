@@ -1,21 +1,25 @@
-import os
-import time
-import requests
-import pandas as pd
-import boto3
-import json
-import re
 import io
+import json
+import os
+import re
+import time
+from datetime import datetime
+from pathlib import Path
+
+import boto3
+import pandas as pd
+import requests
 from botocore.config import Config
 from bs4 import BeautifulSoup
-from pathlib import Path
-from datetime import datetime
 from dotenv import load_dotenv
 
 load_dotenv()
 
+SCHEMA_VERSION = "2026-05-03"
+DEFAULT_ELECTION_URL_PREFIX = "ResultAcGenMay2026"
+
 # --- CONFIGURATION (Globals updated in main) ---
-ELECTION_URL_PREFIX = None
+ELECTION_URL_PREFIX = DEFAULT_ELECTION_URL_PREFIX
 ELECTION_ID = "2026_RESULTS"
 R2_ACCOUNT_ID = None
 R2_ACCESS_KEY_ID = None
@@ -24,220 +28,656 @@ R2_BUCKET_NAME = None
 R2_ENDPOINT_URL = None
 
 STATE_CONFIG = {
-    "West Bengal": {"code": "S25", "count": 294, "trend_pages": 30},
-    "Tamil Nadu": {"code": "S22", "count": 234, "trend_pages": 24},
-    "Assam": {"code": "S03", "count": 126, "trend_pages": 13},
-    "Kerala": {"code": "S11", "count": 140, "trend_pages": 14},
-    "Puducherry": {"code": "U07", "count": 30, "trend_pages": 3}
+    "West Bengal": {"code": "S25", "count": 294, "trend_pages": 30, "dashboard_key": "wb"},
+    "Tamil Nadu": {"code": "S22", "count": 234, "trend_pages": 24, "dashboard_key": "tn"},
+    "Assam": {"code": "S03", "count": 126, "trend_pages": 13, "dashboard_key": "as"},
+    "Kerala": {"code": "S11", "count": 140, "trend_pages": 14, "dashboard_key": "kl"},
+    "Puducherry": {"code": "U07", "count": 30, "trend_pages": 3, "dashboard_key": "py"},
 }
 
 CACHE_DIR = Path("cache")
 CACHE_DIR.mkdir(exist_ok=True)
-TRENDS_CACHE_FILE = CACHE_DIR / "trends_cache.json"
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/91.0.4472.124 Safari/537.36"
+    )
 }
 
-DELAY_BETWEEN_REQUESTS = 1.0
+DELAY_BETWEEN_REQUESTS = 0.0
+POLL_INTERVAL_SECONDS = 30.0
+
+
+def now_timestamp() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def clean_text(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def build_object_key(*parts: str) -> str:
+    clean_parts = []
+    for part in parts:
+        if part is None:
+            continue
+        text = str(part).strip("/")
+        if text:
+            clean_parts.append(text)
+    return "/".join(clean_parts)
+
+
+def get_root_prefix() -> str:
+    return build_object_key("elections", ELECTION_ID)
+
+
+def get_cache_file() -> Path:
+    return CACHE_DIR / f"trends_cache_{ELECTION_ID}.json"
+
+
+def ensure_cache_shape(cache: dict | None) -> dict:
+    shaped = cache if isinstance(cache, dict) else {}
+    shaped.setdefault("partywise", {})
+    shaped.setdefault("statewide", {})
+    return shaped
+
+
+def normalize_constituency_no(value) -> str:
+    digits = re.sub(r"\D", "", str(value or ""))
+    if not digits:
+        raise ValueError(f"Unable to normalize constituency number from {value!r}")
+    return digits.zfill(3)
+
+
+def make_constituency_key(state_code: str, constituency_no) -> str:
+    return f"{state_code}-{normalize_constituency_no(constituency_no)}"
+
+
+def get_summary_dataset_keys(dataset_name: str) -> dict:
+    prefix = build_object_key(get_root_prefix(), "summary", dataset_name)
+    return {
+        "current": build_object_key(prefix, "current.csv"),
+        "history": build_object_key(prefix, "history.csv"),
+    }
+
+
+def get_state_dataset_keys(state_code: str, dataset_name: str) -> dict:
+    prefix = build_object_key(get_root_prefix(), "states", state_code, dataset_name)
+    return {
+        "current": build_object_key(prefix, "current.csv"),
+        "history": build_object_key(prefix, "history.csv"),
+    }
+
+
+def get_constituency_dataset_keys(state_code: str, constituency_no, dataset_name: str = "candidatewise") -> dict:
+    constituency_segment = normalize_constituency_no(constituency_no)
+    prefix = build_object_key(
+        get_root_prefix(),
+        "states",
+        state_code,
+        "constituencies",
+        constituency_segment,
+        dataset_name,
+    )
+    return {
+        "current": build_object_key(prefix, "current.csv"),
+        "history": build_object_key(prefix, "history.csv"),
+    }
+
+
+def get_manifest_key() -> str:
+    return build_object_key(get_root_prefix(), "manifest.json")
+
+
+def build_manifest() -> dict:
+    root_prefix = get_root_prefix()
+    states = {}
+    for state_name, config in STATE_CONFIG.items():
+        state_code = config["code"]
+        states[state_code] = {
+            "state_name": state_name,
+            "state_code": state_code,
+            "dashboard_key": config["dashboard_key"],
+            "seat_count": config["count"],
+            "partywise": {
+                "current_key": get_state_dataset_keys(state_code, "partywise")["current"],
+                "history_key": get_state_dataset_keys(state_code, "partywise")["history"],
+            },
+            "statewide_trends": {
+                "current_key": get_state_dataset_keys(state_code, "statewide-trends")["current"],
+                "history_key": get_state_dataset_keys(state_code, "statewide-trends")["history"],
+            },
+            "constituencies_prefix": build_object_key(root_prefix, "states", state_code, "constituencies"),
+        }
+
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "generated_at": now_timestamp(),
+        "election_id": ELECTION_ID,
+        "root_prefix": root_prefix,
+        "summary": {
+            "partywise": {
+                "current_key": get_summary_dataset_keys("partywise")["current"],
+                "history_key": get_summary_dataset_keys("partywise")["history"],
+            },
+            "statewide_trends": {
+                "current_key": get_summary_dataset_keys("statewide-trends")["current"],
+                "history_key": get_summary_dataset_keys("statewide-trends")["history"],
+            },
+        },
+        "states": states,
+        "templates": {
+            "partywise_current": "elections/{election_id}/states/{state_code}/partywise/current.csv",
+            "partywise_history": "elections/{election_id}/states/{state_code}/partywise/history.csv",
+            "statewide_trends_current": (
+                "elections/{election_id}/states/{state_code}/statewide-trends/current.csv"
+            ),
+            "statewide_trends_history": (
+                "elections/{election_id}/states/{state_code}/statewide-trends/history.csv"
+            ),
+            "candidatewise_current": (
+                "elections/{election_id}/states/{state_code}/constituencies/"
+                "{constituency_no_padded}/candidatewise/current.csv"
+            ),
+            "candidatewise_history": (
+                "elections/{election_id}/states/{state_code}/constituencies/"
+                "{constituency_no_padded}/candidatewise/history.csv"
+            ),
+            "summary_partywise_current": "elections/{election_id}/summary/partywise/current.csv",
+            "summary_partywise_history": "elections/{election_id}/summary/partywise/history.csv",
+            "summary_statewide_trends_current": (
+                "elections/{election_id}/summary/statewide-trends/current.csv"
+            ),
+            "summary_statewide_trends_history": (
+                "elections/{election_id}/summary/statewide-trends/history.csv"
+            ),
+        },
+        "constituency_no_format": "3-digit zero-padded string",
+    }
+
 
 def update_config():
-    global ELECTION_URL_PREFIX, ELECTION_ID, R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME, R2_ENDPOINT_URL, DELAY_BETWEEN_REQUESTS
+    global ELECTION_URL_PREFIX, ELECTION_ID, R2_ACCOUNT_ID, R2_ACCESS_KEY_ID
+    global R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME, R2_ENDPOINT_URL
+    global DELAY_BETWEEN_REQUESTS, POLL_INTERVAL_SECONDS
+
     load_dotenv(override=True)
-    ELECTION_URL_PREFIX = os.getenv("ELECTION_URL_PREFIX")
+    ELECTION_URL_PREFIX = os.getenv("ELECTION_URL_PREFIX", DEFAULT_ELECTION_URL_PREFIX)
     ELECTION_ID = os.getenv("ELECTION_ID", "2026_RESULTS")
     R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID")
     R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID")
     R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY")
     R2_BUCKET_NAME = os.getenv("R2_BUCKET_NAME")
     R2_ENDPOINT_URL = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com" if R2_ACCOUNT_ID else None
-    DELAY_BETWEEN_REQUESTS = float(os.getenv("DELAY_BETWEEN_REQUESTS", "1.0"))
+    DELAY_BETWEEN_REQUESTS = float(os.getenv("DELAY_BETWEEN_REQUESTS", "0.0"))
+    POLL_INTERVAL_SECONDS = float(os.getenv("POLL_INTERVAL_SECONDS", "30"))
+
 
 def get_r2_client():
     if not all([R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY]):
         return None
-    return boto3.client("s3", endpoint_url=R2_ENDPOINT_URL, aws_access_key_id=R2_ACCESS_KEY_ID,
-                        aws_secret_access_key=R2_SECRET_ACCESS_KEY, config=Config(signature_version="s3v4"), region_name="auto")
+    return boto3.client(
+        "s3",
+        endpoint_url=R2_ENDPOINT_URL,
+        aws_access_key_id=R2_ACCESS_KEY_ID,
+        aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+        config=Config(signature_version="s3v4"),
+        region_name="auto",
+    )
+
 
 def upload_to_r2(content, key, content_type="text/csv"):
     client = get_r2_client()
-    if not client: return False
+    if not client:
+        return False
     try:
         client.put_object(Bucket=R2_BUCKET_NAME, Key=key, Body=content, ContentType=content_type)
         print(f"Uploaded to R2: {key}")
         return True
-    except Exception as e:
-        print(f"Error uploading to R2: {e}"); return False
+    except Exception as exc:
+        print(f"Error uploading to R2: {exc}")
+        return False
+
 
 def get_from_r2(key):
     client = get_r2_client()
-    if not client: return None
+    if not client:
+        return None
     try:
         response = client.get_object(Bucket=R2_BUCKET_NAME, Key=key)
-        return response['Body'].read().decode('utf-8')
-    except: return None
+        return response["Body"].read().decode("utf-8")
+    except Exception:
+        return None
 
-def update_consolidated_file(new_df, key):
+
+def update_consolidated_file(new_df: pd.DataFrame, key: str):
     """Appends new data to a consolidated history file in R2."""
     existing_content = get_from_r2(key)
     if existing_content:
         existing_df = pd.read_csv(io.StringIO(existing_content))
-        # Drop duplicates if scraping logic overlaps, keeping newest
         combined_df = pd.concat([existing_df, new_df], ignore_index=True)
-        # We might want to keep history, so we don't drop duplicates unless they are truly identical
-        # but for election trends, timestamp makes them unique.
     else:
         combined_df = new_df
-    
+
     upload_to_r2(combined_df.to_csv(index=False), key)
 
-def fetch_party_wise(state_code: str) -> pd.DataFrame | None:
+
+def load_dataframe_from_r2(key: str) -> pd.DataFrame | None:
+    content = get_from_r2(key)
+    if not content:
+        return None
+    return pd.read_csv(io.StringIO(content))
+
+
+def maybe_sleep_between_requests():
+    if DELAY_BETWEEN_REQUESTS > 0:
+        time.sleep(DELAY_BETWEEN_REQUESTS)
+
+
+def get_nested_table_primary_text(cell) -> str | None:
+    nested_table = cell.find("table", recursive=False) or cell.find("table")
+    if not nested_table:
+        return None
+    nested_row = nested_table.find("tr")
+    if not nested_row:
+        return ""
+    nested_cells = nested_row.find_all("td", recursive=False)
+    if not nested_cells:
+        return ""
+    return clean_text(nested_cells[0].get_text(" ", strip=True))
+
+
+def extract_statewise_cell_text(cell, nested: bool = False) -> str:
+    if nested:
+        text = get_nested_table_primary_text(cell)
+        if text is not None:
+            return text
+    return clean_text(cell.get_text(" ", strip=True))
+
+
+def get_state_trend_table(soup: BeautifulSoup):
+    return soup.select_one("div.custom-table table") or soup.select_one("div.table-responsive > table") or soup.find("table")
+
+
+def get_state_trend_page_count(soup: BeautifulSoup, state_code: str) -> int | None:
+    page_numbers = []
+    for link in soup.select("a.page-link[href]"):
+        href = link.get("href", "")
+        match = re.search(rf"statewise{re.escape(state_code)}(\d+)\.htm", href)
+        if match:
+            page_numbers.append(int(match.group(1)))
+    return max(page_numbers) if page_numbers else None
+
+
+def build_partywise_snapshot(df: pd.DataFrame) -> list[dict]:
+    if df is None or df.empty:
+        return []
+    records = (
+        df[["Party", "Won", "Leading", "Total"]]
+        .fillna("")
+        .astype(str)
+        .sort_values(["Party", "Won", "Leading", "Total"], kind="stable")
+        .to_dict("records")
+    )
+    return records
+
+
+def extract_statewide_snapshot_from_rows(rows: list[dict]) -> dict:
+    snapshot = {}
+    for row in rows:
+        constituency_key = row["Constituency_Key"]
+        snapshot[constituency_key] = {
+            "Constituency_No": str(row["Constituency_No"]),
+            "Constituency_Name": str(row["Constituency_Name"]),
+            "Leading_Candidate": str(row["Leading_Candidate"]),
+            "Leading_Party": str(row["Leading_Party"]),
+            "Trailing_Candidate": str(row["Trailing_Candidate"]),
+            "Trailing_Party": str(row["Trailing_Party"]),
+            "Margin": str(row["Margin"]),
+            "Round": str(row.get("Round", "")),
+            "Status": str(row["Status"]),
+        }
+    return snapshot
+
+
+def get_changed_constituency_keys(previous_snapshot: dict, current_snapshot: dict) -> list[str]:
+    changed_keys = []
+    for constituency_key, current_row in current_snapshot.items():
+        if previous_snapshot.get(constituency_key) != current_row:
+            changed_keys.append(constituency_key)
+    return changed_keys
+
+
+def load_previous_party_snapshot(state_code: str, cache: dict) -> list[dict]:
+    cached = cache["partywise"].get(state_code)
+    if cached is not None:
+        return cached
+
+    current_key = get_state_dataset_keys(state_code, "partywise")["current"]
+    df = load_dataframe_from_r2(current_key)
+    if df is None:
+        return []
+    snapshot = build_partywise_snapshot(df)
+    cache["partywise"][state_code] = snapshot
+    return snapshot
+
+
+def load_previous_statewide_snapshot(state_code: str, cache: dict) -> dict:
+    cached = cache["statewide"].get(state_code)
+    if cached is not None:
+        return cached
+
+    current_key = get_state_dataset_keys(state_code, "statewide-trends")["current"]
+    df = load_dataframe_from_r2(current_key)
+    if df is None:
+        return {}
+    snapshot = {}
+    for row in df.fillna("").to_dict("records"):
+        constituency_key = row.get("Constituency_Key") or make_constituency_key(
+            state_code, row.get("Constituency_No", "")
+        )
+        snapshot[constituency_key] = {
+            "Constituency_No": str(row.get("Constituency_No", "")),
+            "Constituency_Name": str(row.get("Constituency_Name", "")),
+            "Leading_Candidate": str(row.get("Leading_Candidate", "")),
+            "Leading_Party": str(row.get("Leading_Party", "")),
+            "Trailing_Candidate": str(row.get("Trailing_Candidate", "")),
+            "Trailing_Party": str(row.get("Trailing_Party", "")),
+            "Margin": str(row.get("Margin", "")),
+            "Round": str(row.get("Round", "")),
+            "Status": str(row.get("Status", "")),
+        }
+
+    cache["statewide"][state_code] = snapshot
+    return snapshot
+
+
+def build_summary_frames(
+    state_codes: list[str], frames_by_state: dict[str, pd.DataFrame], dataset_name: str
+) -> list[pd.DataFrame]:
+    frames = []
+    for state_code in state_codes:
+        frame = frames_by_state.get(state_code)
+        if frame is None:
+            current_key = get_state_dataset_keys(state_code, dataset_name)["current"]
+            frame = load_dataframe_from_r2(current_key)
+        if frame is not None and not frame.empty:
+            frames.append(frame)
+    return frames
+
+
+def fetch_party_wise(state_name: str, state_code: str) -> pd.DataFrame | None:
     """Fetches party-wise results for a state."""
     url = f"https://results.eci.gov.in/{ELECTION_URL_PREFIX}/partywiseresult-{state_code}.htm"
+    timestamp = now_timestamp()
     try:
         response = requests.get(url, headers=HEADERS, timeout=10)
-        if response.status_code != 200: return None
+        if response.status_code != 200:
+            return None
         soup = BeautifulSoup(response.text, "html.parser")
-        table = soup.select_one('#div1 table')
-        if not table: return None
-        
-        rows = []
-        for tr in table.find_all('tr')[1:]: # Skip header
-            tds = tr.find_all('td')
-            if len(tds) < 4: continue
-            rows.append({
-                "Party": tds[0].text.strip(),
-                "Won": tds[1].text.strip(),
-                "Leading": tds[2].text.strip(),
-                "Total": tds[3].text.strip(),
-                "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            })
-        return pd.DataFrame(rows) if rows else None
-    except Exception as e:
-        print(f"Error party-wise {state_code}: {e}"); return None
+        table = soup.select_one("div.rslt-table table") or soup.select_one("div.card-body table") or soup.find("table")
+        if not table:
+            return None
 
-def fetch_state_trends(state_name: str, state_code: str, page_no: int) -> list:
-    """Fetches trends (summary of multiple ACs). Columns: Const, Leading Cand, Party, Trailing Cand, Party, Margin, Status."""
+        rows = []
+        tbody = table.find("tbody")
+        if not tbody:
+            return pd.DataFrame(rows)
+
+        for tr in tbody.find_all("tr", recursive=False):
+            tds = tr.find_all("td", recursive=False)
+            if len(tds) < 4:
+                continue
+            rows.append(
+                {
+                    "Election_Id": ELECTION_ID,
+                    "State": state_name,
+                    "State_Code": state_code,
+                    "Party": clean_text(tds[0].get_text(" ", strip=True)),
+                    "Won": clean_text(tds[1].get_text(" ", strip=True)),
+                    "Leading": clean_text(tds[2].get_text(" ", strip=True)),
+                    "Total": clean_text(tds[3].get_text(" ", strip=True)),
+                    "Timestamp": timestamp,
+                }
+            )
+        return pd.DataFrame(rows)
+    except Exception as exc:
+        print(f"Error party-wise {state_code}: {exc}")
+        return None
+
+
+def fetch_state_trends(state_name: str, state_code: str, page_no: int) -> tuple[list[dict], int | None]:
+    """Fetches state trend rows plus discovered pagination size."""
     url = f"https://results.eci.gov.in/{ELECTION_URL_PREFIX}/statewise{state_code}{page_no}.htm"
+    timestamp = now_timestamp()
     results = []
+    page_count = None
     try:
         response = requests.get(url, headers=HEADERS, timeout=10)
-        if response.status_code != 200: return []
+        if response.status_code != 200:
+            return [], None
         soup = BeautifulSoup(response.text, "html.parser")
-        table = soup.find("table", {"id": "ElectionResult"}) or soup.find("table")
-        if not table: return []
-        for tr in table.find_all('tr'):
-            tds = tr.find_all('td', recursive=False)
-            if len(tds) < 7: continue
-            ac_link = tds[0].find('a')
-            ac_no = int(re.search(r'(\d+)\.htm', ac_link['href']).group(1)) if ac_link else None
-            results.append({
-                "State": state_name, "State_Code": state_code,
-                "Constituency_Name": tds[0].text.strip(), "Constituency_No": ac_no,
-                "Leading_Candidate": tds[2].text.strip(), "Leading_Party": tds[3].text.strip(),
-                "Trailing_Candidate": tds[4].text.strip(), "Trailing_Party": tds[5].text.strip(),
-                "Margin": tds[6].text.strip(), "Status": tds[7].text.strip() if len(tds) > 7 else "In Progress",
-                "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            })
-    except Exception as e: print(f"Error trends {state_name} P{page_no}: {e}")
-    return results
+        table = get_state_trend_table(soup)
+        if not table:
+            return [], None
+        page_count = get_state_trend_page_count(soup, state_code)
 
-def fetch_constituency_details(state_name: str, state_code: str, const_no: int) -> pd.DataFrame | None:
-    """Fetches candidate-wise details. Columns: SN, Candidate, Party, EVM, Postal, Total, %."""
-    url = f"https://results.eci.gov.in/{ELECTION_URL_PREFIX}/Constituencywise{state_code}{const_no}.htm"
+        tbody = table.find("tbody") or table
+        for tr in tbody.find_all("tr", recursive=False):
+            tds = tr.find_all("td", recursive=False)
+            if len(tds) < 9:
+                continue
+
+            ac_link = tds[0].find("a")
+            href = ac_link.get("href", "") if ac_link else ""
+            ac_match = re.search(r"(\d+)\.htm", href)
+            if ac_match:
+                constituency_no = int(ac_match.group(1))
+            else:
+                constituency_no_text = clean_text(tds[1].get_text(" ", strip=True))
+                if not constituency_no_text.isdigit():
+                    continue
+                constituency_no = int(constituency_no_text)
+
+            results.append(
+                {
+                    "Election_Id": ELECTION_ID,
+                    "State": state_name,
+                    "State_Code": state_code,
+                    "Constituency_No": constituency_no,
+                    "Constituency_Key": make_constituency_key(state_code, constituency_no),
+                    "Constituency_Name": extract_statewise_cell_text(tds[0]),
+                    "Leading_Candidate": extract_statewise_cell_text(tds[2]),
+                    "Leading_Party": extract_statewise_cell_text(tds[3], nested=True),
+                    "Trailing_Candidate": extract_statewise_cell_text(tds[4]),
+                    "Trailing_Party": extract_statewise_cell_text(tds[5], nested=True),
+                    "Margin": extract_statewise_cell_text(tds[6]),
+                    "Round": extract_statewise_cell_text(tds[7]),
+                    "Status": extract_statewise_cell_text(tds[8]),
+                    "Timestamp": timestamp,
+                }
+            )
+    except Exception as exc:
+        print(f"Error trends {state_name} P{page_no}: {exc}")
+    return results, page_count
+
+
+def fetch_constituency_details(
+    state_name: str, state_code: str, constituency_no: int, constituency_name: str
+) -> pd.DataFrame | None:
+    """Fetches candidate-wise details for a constituency."""
+    url = f"https://results.eci.gov.in/{ELECTION_URL_PREFIX}/Constituencywise{state_code}{constituency_no}.htm"
+    timestamp = now_timestamp()
     try:
         response = requests.get(url, headers=HEADERS, timeout=10)
-        if response.status_code != 200: return None
+        if response.status_code != 200:
+            return None
         soup = BeautifulSoup(response.text, "html.parser")
-        table = soup.select_one('div.table-responsive > table') or soup.find("table")
-        if not table: return None
+        table = soup.select_one("div.table-responsive > table") or soup.find("table")
+        if not table:
+            return None
+
         rows = []
-        tbody = table.find('tbody') or table
-        for tr in tbody.find_all('tr'):
-            tds = tr.find_all('td', recursive=False)
-            if len(tds) < 6: continue
-            rows.append({
-                "SN": tds[0].text.strip(), "Candidate": tds[1].text.strip(), "Party": tds[2].text.strip(),
-                "EVM_Votes": tds[3].text.strip(), "Postal_Votes": tds[4].text.strip(),
-                "Total_Votes": tds[5].text.strip(), "Vote_Percentage": tds[6].text.strip() if len(tds) > 6 else "",
-                "State": state_name, "Constituency_No": const_no, "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            })
+        tbody = table.find("tbody") or table
+        for tr in tbody.find_all("tr"):
+            tds = tr.find_all("td", recursive=False)
+            if len(tds) < 6:
+                continue
+            rows.append(
+                {
+                    "Election_Id": ELECTION_ID,
+                    "State": state_name,
+                    "State_Code": state_code,
+                    "Constituency_No": constituency_no,
+                    "Constituency_Key": make_constituency_key(state_code, constituency_no),
+                    "Constituency_Name": constituency_name,
+                    "SN": tds[0].text.strip(),
+                    "Candidate": tds[1].text.strip(),
+                    "Party": tds[2].text.strip(),
+                    "EVM_Votes": tds[3].text.strip(),
+                    "Postal_Votes": tds[4].text.strip(),
+                    "Total_Votes": tds[5].text.strip(),
+                    "Vote_Percentage": tds[6].text.strip() if len(tds) > 6 else "",
+                    "Timestamp": timestamp,
+                }
+            )
         return pd.DataFrame(rows) if rows else None
-    except Exception as e: print(f"Error detail {state_name} AC {const_no}: {e}"); return None
+    except Exception as exc:
+        print(f"Error detail {state_name} AC {constituency_no}: {exc}")
+        return None
+
+
+def load_cache() -> dict:
+    cache_file = get_cache_file()
+    if not cache_file.exists():
+        return ensure_cache_shape({})
+    try:
+        with cache_file.open("r", encoding="utf-8") as handle:
+            return ensure_cache_shape(json.load(handle))
+    except Exception:
+        return ensure_cache_shape({})
+
+
+def save_cache(cache: dict):
+    cache_file = get_cache_file()
+    with cache_file.open("w", encoding="utf-8") as handle:
+        json.dump(cache, handle, indent=2)
+
 
 def scrape_all():
     print(f"Cycle starting: {datetime.now()}")
-    cache = json.load(open(TRENDS_CACHE_FILE)) if TRENDS_CACHE_FILE.exists() else {}
-    all_state_trends = []
-    all_party_summaries = []
+    cache = load_cache()
+    state_codes = [config["code"] for config in STATE_CONFIG.values()]
+    state_trend_frames_by_state = {}
+    party_frames_by_state = {}
+    any_statewide_change = False
+    any_partywise_change = False
 
-    for state, config in STATE_CONFIG.items():
-        # 1. Party-wise (Latest and Consolidated)
-        party_df = fetch_party_wise(config["code"])
+    for state_name, config in STATE_CONFIG.items():
+        state_code = config["code"]
+
+        party_df = fetch_party_wise(state_name, state_code)
         if party_df is not None:
-            party_df["State"] = state
-            upload_to_r2(party_df.to_csv(index=False), f"results/party_wise_{config['code']}_latest.csv")
-            update_consolidated_file(party_df, f"results/party_wise_{config['code']}_history.csv")
-            all_party_summaries.append(party_df)
+            party_frames_by_state[state_code] = party_df
+            previous_party_snapshot = load_previous_party_snapshot(state_code, cache)
+            current_party_snapshot = build_partywise_snapshot(party_df)
 
-        # 2. State-wise Trends
+            if current_party_snapshot != previous_party_snapshot:
+                party_keys = get_state_dataset_keys(state_code, "partywise")
+                upload_to_r2(party_df.to_csv(index=False), party_keys["current"])
+                update_consolidated_file(party_df, party_keys["history"])
+                cache["partywise"][state_code] = current_party_snapshot
+                any_partywise_change = True
+
         state_trends = []
-        for p in range(1, config["trend_pages"] + 1):
-            page_results = fetch_state_trends(state, config["code"], p)
-            if not page_results: break
+        max_trend_pages = config["trend_pages"]
+        page_no = 1
+        while page_no <= max_trend_pages:
+            page_results, discovered_trend_pages = fetch_state_trends(state_name, state_code, page_no)
+            if discovered_trend_pages:
+                max_trend_pages = discovered_trend_pages
+            if not page_results:
+                break
             state_trends.extend(page_results)
-            time.sleep(DELAY_BETWEEN_REQUESTS)
-        
-        if state_trends:
-            trends_df = pd.DataFrame(state_trends)
-            upload_to_r2(trends_df.to_csv(index=False), f"results/trends_{config['code']}_latest.csv")
-            update_consolidated_file(trends_df, f"results/trends_{config['code']}_history.csv")
-            all_state_trends.extend(state_trends)
+            maybe_sleep_between_requests()
+            page_no += 1
 
-            # 3. Targeted Constituency-wise Details
-            for trend in state_trends:
-                ac_key = f"{trend['State_Code']}_{trend['Constituency_No']}"
-                old = cache.get(ac_key, {})
-                if (trend['Leading_Candidate'] != old.get('Leading_Candidate') or 
-                    trend['Margin'] != old.get('Margin') or trend['Status'] != old.get('Status')):
-                    
-                    print(f"Update: {state} AC {trend['Constituency_No']}")
-                    detail_df = fetch_constituency_details(state, trend['State_Code'], trend['Constituency_No'])
-                    if detail_df is not None:
-                        upload_to_r2(detail_df.to_csv(index=False), f"results/{trend['State_Code']}/{trend['Constituency_No']}/latest.csv")
-                        update_consolidated_file(detail_df, f"results/{trend['State_Code']}/{trend['Constituency_No']}/history.csv")
-                    cache[ac_key] = trend
-                    time.sleep(DELAY_BETWEEN_REQUESTS)
+        if not state_trends:
+            continue
 
-    # Global summaries
-    if all_state_trends:
-        global_trends_df = pd.DataFrame(all_state_trends)
-        upload_to_r2(global_trends_df.to_csv(index=False), "results/constituency_status_latest.csv")
-        update_consolidated_file(global_trends_df, "results/constituency_status_history.csv")
-    
-    if all_party_summaries:
-        global_party_df = pd.concat(all_party_summaries, ignore_index=True)
-        upload_to_r2(global_party_df.to_csv(index=False), "results/party_summary_latest.csv")
-        update_consolidated_file(global_party_df, "results/party_summary_history.csv")
+        trends_df = pd.DataFrame(state_trends)
+        state_trend_frames_by_state[state_code] = trends_df
 
-    with open(TRENDS_CACHE_FILE, 'w') as f: json.dump(cache, f, indent=2)
+        previous_statewide_snapshot = load_previous_statewide_snapshot(state_code, cache)
+        current_statewide_snapshot = extract_statewide_snapshot_from_rows(state_trends)
+        changed_constituency_keys = get_changed_constituency_keys(
+            previous_statewide_snapshot, current_statewide_snapshot
+        )
+
+        if changed_constituency_keys:
+            state_trend_keys = get_state_dataset_keys(state_code, "statewide-trends")
+            upload_to_r2(trends_df.to_csv(index=False), state_trend_keys["current"])
+            update_consolidated_file(trends_df, state_trend_keys["history"])
+            cache["statewide"][state_code] = current_statewide_snapshot
+            any_statewide_change = True
+
+        if changed_constituency_keys:
+            changed_constituencies = [trend for trend in state_trends if trend["Constituency_Key"] in changed_constituency_keys]
+            for trend in changed_constituencies:
+                print(f"Update: {state_name} AC {trend['Constituency_No']}")
+                detail_df = fetch_constituency_details(
+                    state_name,
+                    trend["State_Code"],
+                    trend["Constituency_No"],
+                    trend["Constituency_Name"],
+                )
+                if detail_df is not None:
+                    candidate_keys = get_constituency_dataset_keys(
+                        trend["State_Code"], trend["Constituency_No"], "candidatewise"
+                    )
+                    upload_to_r2(detail_df.to_csv(index=False), candidate_keys["current"])
+                    update_consolidated_file(detail_df, candidate_keys["history"])
+                maybe_sleep_between_requests()
+
+    if any_statewide_change:
+        summary_state_frames = build_summary_frames(
+            state_codes, state_trend_frames_by_state, "statewide-trends"
+        )
+        if summary_state_frames:
+            global_trends_df = pd.concat(summary_state_frames, ignore_index=True)
+            summary_statewide = get_summary_dataset_keys("statewide-trends")
+            upload_to_r2(global_trends_df.to_csv(index=False), summary_statewide["current"])
+            update_consolidated_file(global_trends_df, summary_statewide["history"])
+
+    if any_partywise_change:
+        summary_party_frames = build_summary_frames(state_codes, party_frames_by_state, "partywise")
+        if summary_party_frames:
+            global_party_df = pd.concat(summary_party_frames, ignore_index=True)
+            summary_partywise = get_summary_dataset_keys("partywise")
+            upload_to_r2(global_party_df.to_csv(index=False), summary_partywise["current"])
+            update_consolidated_file(global_party_df, summary_partywise["history"])
+
+    upload_to_r2(json.dumps(build_manifest(), indent=2), get_manifest_key(), "application/json")
+    save_cache(cache)
     print(f"Cycle complete: {datetime.now()}")
+
 
 def main():
     while True:
+        cycle_started_at = time.time()
         update_config()
-        if not ELECTION_URL_PREFIX:
-            print(f"[{datetime.now()}] ELECTION_URL_PREFIX not provided. Waiting...")
-            time.sleep(60)
-            continue
-        
         try:
             scrape_all()
-        except Exception as e:
-            print(f"Error during scrape: {e}")
-            
-        print(f"[{datetime.now()}] Cycle complete. Sleeping for 10 minutes...")
-        time.sleep(600)
+        except Exception as exc:
+            print(f"Error during scrape: {exc}")
+
+        elapsed_seconds = time.time() - cycle_started_at
+        sleep_seconds = max(0.0, POLL_INTERVAL_SECONDS - elapsed_seconds)
+        print(f"[{datetime.now()}] Cycle complete. Sleeping for {sleep_seconds:.1f} seconds...")
+        time.sleep(sleep_seconds)
+
 
 if __name__ == "__main__":
     main()

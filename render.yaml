@@ -6,7 +6,7 @@ services:
     startCommand: python scraper.py
     envVars:
       - key: ELECTION_URL_PREFIX
-        sync: false
+        value: ResultAcGenMay2026
       - key: ELECTION_ID
         sync: false
       - key: R2_ACCOUNT_ID
