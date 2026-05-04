@@ -54,6 +54,10 @@ def now_timestamp() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def log(message: str):
+    print(message, flush=True)
+
+
 def clean_text(value: str) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip()
 
@@ -234,10 +238,10 @@ def upload_to_r2(content, key, content_type="text/csv"):
         return False
     try:
         client.put_object(Bucket=R2_BUCKET_NAME, Key=key, Body=content, ContentType=content_type)
-        print(f"Uploaded to R2: {key}")
+        log(f"Uploaded to R2: {key}")
         return True
     except Exception as exc:
-        print(f"Error uploading to R2: {exc}")
+        log(f"Error uploading to R2: {exc}")
         return False
 
 
@@ -415,6 +419,7 @@ def fetch_party_wise(state_name: str, state_code: str) -> pd.DataFrame | None:
     try:
         response = requests.get(url, headers=HEADERS, timeout=10)
         if response.status_code != 200:
+            log(f"Partywise {state_code} returned HTTP {response.status_code}: {url}")
             return None
         soup = BeautifulSoup(response.text, "html.parser")
         table = soup.select_one("div.rslt-table table") or soup.select_one("div.card-body table") or soup.find("table")
@@ -444,7 +449,7 @@ def fetch_party_wise(state_name: str, state_code: str) -> pd.DataFrame | None:
             )
         return pd.DataFrame(rows)
     except Exception as exc:
-        print(f"Error party-wise {state_code}: {exc}")
+        log(f"Error party-wise {state_code}: {exc}")
         return None
 
 
@@ -457,6 +462,7 @@ def fetch_state_trends(state_name: str, state_code: str, page_no: int) -> tuple[
     try:
         response = requests.get(url, headers=HEADERS, timeout=10)
         if response.status_code != 200:
+            log(f"Statewise {state_code} page {page_no} returned HTTP {response.status_code}: {url}")
             return [], None
         soup = BeautifulSoup(response.text, "html.parser")
         table = get_state_trend_table(soup)
@@ -500,7 +506,7 @@ def fetch_state_trends(state_name: str, state_code: str, page_no: int) -> tuple[
                 }
             )
     except Exception as exc:
-        print(f"Error trends {state_name} P{page_no}: {exc}")
+        log(f"Error trends {state_name} P{page_no}: {exc}")
     return results, page_count
 
 
@@ -513,6 +519,7 @@ def fetch_constituency_details(
     try:
         response = requests.get(url, headers=HEADERS, timeout=10)
         if response.status_code != 200:
+            log(f"Constituency {state_code}-{constituency_no} returned HTTP {response.status_code}: {url}")
             return None
         soup = BeautifulSoup(response.text, "html.parser")
         table = soup.select_one("div.table-responsive > table") or soup.find("table")
@@ -545,7 +552,7 @@ def fetch_constituency_details(
             )
         return pd.DataFrame(rows) if rows else None
     except Exception as exc:
-        print(f"Error detail {state_name} AC {constituency_no}: {exc}")
+        log(f"Error detail {state_name} AC {constituency_no}: {exc}")
         return None
 
 
@@ -567,7 +574,7 @@ def save_cache(cache: dict):
 
 
 def scrape_all():
-    print(f"Cycle starting: {datetime.now()}")
+    log(f"Cycle starting: {datetime.now()}")
     cache = load_cache()
     state_codes = [config["code"] for config in STATE_CONFIG.values()]
     state_trend_frames_by_state = {}
@@ -577,12 +584,14 @@ def scrape_all():
 
     for state_name, config in STATE_CONFIG.items():
         state_code = config["code"]
+        log(f"Starting state scrape: {state_name} ({state_code})")
 
         party_df = fetch_party_wise(state_name, state_code)
         if party_df is not None:
             party_frames_by_state[state_code] = party_df
             previous_party_snapshot = load_previous_party_snapshot(state_code, cache)
             current_party_snapshot = build_partywise_snapshot(party_df)
+            log(f"{state_code} partywise rows fetched: {len(party_df)}")
 
             if current_party_snapshot != previous_party_snapshot:
                 party_keys = get_state_dataset_keys(state_code, "partywise")
@@ -590,6 +599,11 @@ def scrape_all():
                 update_consolidated_file(party_df, party_keys["history"])
                 cache["partywise"][state_code] = current_party_snapshot
                 any_partywise_change = True
+                log(f"{state_code} partywise snapshot changed")
+            else:
+                log(f"{state_code} partywise snapshot unchanged")
+        else:
+            log(f"{state_code} partywise fetch returned no table")
 
         state_trends = []
         max_trend_pages = config["trend_pages"]
@@ -598,6 +612,9 @@ def scrape_all():
             page_results, discovered_trend_pages = fetch_state_trends(state_name, state_code, page_no)
             if discovered_trend_pages:
                 max_trend_pages = discovered_trend_pages
+            log(
+                f"{state_code} statewise page {page_no}/{max_trend_pages} rows: {len(page_results)}"
+            )
             if not page_results:
                 break
             state_trends.extend(page_results)
@@ -605,16 +622,19 @@ def scrape_all():
             page_no += 1
 
         if not state_trends:
+            log(f"{state_code} produced no statewide rows")
             continue
 
         trends_df = pd.DataFrame(state_trends)
         state_trend_frames_by_state[state_code] = trends_df
+        log(f"{state_code} total statewide rows fetched: {len(trends_df)}")
 
         previous_statewide_snapshot = load_previous_statewide_snapshot(state_code, cache)
         current_statewide_snapshot = extract_statewide_snapshot_from_rows(state_trends)
         changed_constituency_keys = get_changed_constituency_keys(
             previous_statewide_snapshot, current_statewide_snapshot
         )
+        log(f"{state_code} changed constituencies: {len(changed_constituency_keys)}")
 
         if changed_constituency_keys:
             state_trend_keys = get_state_dataset_keys(state_code, "statewide-trends")
@@ -622,11 +642,14 @@ def scrape_all():
             update_consolidated_file(trends_df, state_trend_keys["history"])
             cache["statewide"][state_code] = current_statewide_snapshot
             any_statewide_change = True
+            log(f"{state_code} statewide snapshot changed")
+        else:
+            log(f"{state_code} statewide snapshot unchanged")
 
         if changed_constituency_keys:
             changed_constituencies = [trend for trend in state_trends if trend["Constituency_Key"] in changed_constituency_keys]
             for trend in changed_constituencies:
-                print(f"Update: {state_name} AC {trend['Constituency_No']}")
+                log(f"Update: {state_name} AC {trend['Constituency_No']}")
                 detail_df = fetch_constituency_details(
                     state_name,
                     trend["State_Code"],
@@ -639,6 +662,11 @@ def scrape_all():
                     )
                     upload_to_r2(detail_df.to_csv(index=False), candidate_keys["current"])
                     update_consolidated_file(detail_df, candidate_keys["history"])
+                    log(
+                        f"{trend['State_Code']}-{trend['Constituency_No']} candidate rows fetched: {len(detail_df)}"
+                    )
+                else:
+                    log(f"{trend['State_Code']}-{trend['Constituency_No']} candidate fetch returned no table")
                 maybe_sleep_between_requests()
 
     if any_statewide_change:
@@ -661,7 +689,7 @@ def scrape_all():
 
     upload_to_r2(json.dumps(build_manifest(), indent=2), get_manifest_key(), "application/json")
     save_cache(cache)
-    print(f"Cycle complete: {datetime.now()}")
+    log(f"Cycle complete: {datetime.now()}")
 
 
 def main():
@@ -671,11 +699,11 @@ def main():
         try:
             scrape_all()
         except Exception as exc:
-            print(f"Error during scrape: {exc}")
+            log(f"Error during scrape: {exc}")
 
         elapsed_seconds = time.time() - cycle_started_at
         sleep_seconds = max(0.0, POLL_INTERVAL_SECONDS - elapsed_seconds)
-        print(f"[{datetime.now()}] Cycle complete. Sleeping for {sleep_seconds:.1f} seconds...")
+        log(f"[{datetime.now()}] Cycle complete. Sleeping for {sleep_seconds:.1f} seconds...")
         time.sleep(sleep_seconds)
 
 
