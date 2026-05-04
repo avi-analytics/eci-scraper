@@ -11,6 +11,10 @@ import pandas as pd
 import requests
 from botocore.config import Config
 from bs4 import BeautifulSoup
+try:
+    from curl_cffi import requests as browser_requests
+except ImportError:
+    browser_requests = None
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -28,6 +32,7 @@ R2_SECRET_ACCESS_KEY = None
 R2_BUCKET_NAME = None
 R2_ENDPOINT_URL = None
 HTTP_SESSION = None
+HTTP_IMPERSONATE_BROWSER = browser_requests is not None
 
 STATE_CONFIG = {
     "West Bengal": {"code": "S25", "count": 294, "trend_pages": 30, "dashboard_key": "wb"},
@@ -253,7 +258,8 @@ def get_r2_client():
 def get_http_session() -> requests.Session:
     global HTTP_SESSION
     if HTTP_SESSION is None:
-        HTTP_SESSION = requests.Session()
+        session_factory = browser_requests.Session if HTTP_IMPERSONATE_BROWSER else requests.Session
+        HTTP_SESSION = session_factory()
         HTTP_SESSION.headers.update(HEADERS)
     return HTTP_SESSION
 
@@ -261,9 +267,13 @@ def get_http_session() -> requests.Session:
 def bootstrap_http_session() -> bool:
     session = get_http_session()
     try:
-        response = session.get(get_index_url(), timeout=15)
+        if HTTP_IMPERSONATE_BROWSER:
+            response = session.get(get_index_url(), timeout=15, impersonate="chrome124")
+        else:
+            response = session.get(get_index_url(), timeout=15)
         log(
             f"Bootstrapped ECI session with HTTP {response.status_code}; "
+            f"impersonation={'on' if HTTP_IMPERSONATE_BROWSER else 'off'}; "
             f"cookies={len(session.cookies)}"
         )
         return response.status_code == 200
@@ -279,7 +289,10 @@ def fetch_url(url: str, referer: str | None = None) -> requests.Response | None:
         headers["Referer"] = referer
 
     try:
-        response = session.get(url, headers=headers, timeout=15)
+        if HTTP_IMPERSONATE_BROWSER:
+            response = session.get(url, headers=headers, timeout=15, impersonate="chrome124")
+        else:
+            response = session.get(url, headers=headers, timeout=15)
     except Exception as exc:
         log(f"HTTP request failed for {url}: {exc}")
         return None
@@ -288,7 +301,10 @@ def fetch_url(url: str, referer: str | None = None) -> requests.Response | None:
         log(f"Received HTTP 403 for {url}; retrying after session bootstrap")
         if bootstrap_http_session():
             try:
-                response = session.get(url, headers=headers, timeout=15)
+                if HTTP_IMPERSONATE_BROWSER:
+                    response = session.get(url, headers=headers, timeout=15, impersonate="chrome124")
+                else:
+                    response = session.get(url, headers=headers, timeout=15)
             except Exception as exc:
                 log(f"HTTP retry failed for {url}: {exc}")
                 return None
