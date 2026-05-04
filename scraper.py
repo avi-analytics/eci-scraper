@@ -17,6 +17,7 @@ load_dotenv()
 
 SCHEMA_VERSION = "2026-05-03"
 DEFAULT_ELECTION_URL_PREFIX = "ResultAcGenMay2026"
+BASE_RESULTS_URL = "https://results.eci.gov.in"
 
 # --- CONFIGURATION (Globals updated in main) ---
 ELECTION_URL_PREFIX = DEFAULT_ELECTION_URL_PREFIX
@@ -26,6 +27,7 @@ R2_ACCESS_KEY_ID = None
 R2_SECRET_ACCESS_KEY = None
 R2_BUCKET_NAME = None
 R2_ENDPOINT_URL = None
+HTTP_SESSION = None
 
 STATE_CONFIG = {
     "West Bengal": {"code": "S25", "count": 294, "trend_pages": 30, "dashboard_key": "wb"},
@@ -43,7 +45,15 @@ HEADERS = {
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/91.0.4472.124 Safari/537.36"
-    )
+    ),
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,image/apng,*/*;q=0.8"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "Upgrade-Insecure-Requests": "1",
 }
 
 DELAY_BETWEEN_REQUESTS = 0.0
@@ -56,6 +66,14 @@ def now_timestamp() -> str:
 
 def log(message: str):
     print(message, flush=True)
+
+
+def get_election_base_url() -> str:
+    return f"{BASE_RESULTS_URL}/{ELECTION_URL_PREFIX}"
+
+
+def get_index_url() -> str:
+    return f"{get_election_base_url()}/index.htm"
 
 
 def clean_text(value: str) -> str:
@@ -230,6 +248,51 @@ def get_r2_client():
         config=Config(signature_version="s3v4"),
         region_name="auto",
     )
+
+
+def get_http_session() -> requests.Session:
+    global HTTP_SESSION
+    if HTTP_SESSION is None:
+        HTTP_SESSION = requests.Session()
+        HTTP_SESSION.headers.update(HEADERS)
+    return HTTP_SESSION
+
+
+def bootstrap_http_session() -> bool:
+    session = get_http_session()
+    try:
+        response = session.get(get_index_url(), timeout=15)
+        log(
+            f"Bootstrapped ECI session with HTTP {response.status_code}; "
+            f"cookies={len(session.cookies)}"
+        )
+        return response.status_code == 200
+    except Exception as exc:
+        log(f"Error bootstrapping ECI session: {exc}")
+        return False
+
+
+def fetch_url(url: str, referer: str | None = None) -> requests.Response | None:
+    session = get_http_session()
+    headers = {}
+    if referer:
+        headers["Referer"] = referer
+
+    try:
+        response = session.get(url, headers=headers, timeout=15)
+    except Exception as exc:
+        log(f"HTTP request failed for {url}: {exc}")
+        return None
+
+    if response.status_code == 403:
+        log(f"Received HTTP 403 for {url}; retrying after session bootstrap")
+        if bootstrap_http_session():
+            try:
+                response = session.get(url, headers=headers, timeout=15)
+            except Exception as exc:
+                log(f"HTTP retry failed for {url}: {exc}")
+                return None
+    return response
 
 
 def upload_to_r2(content, key, content_type="text/csv"):
@@ -414,10 +477,12 @@ def build_summary_frames(
 
 def fetch_party_wise(state_name: str, state_code: str) -> pd.DataFrame | None:
     """Fetches party-wise results for a state."""
-    url = f"https://results.eci.gov.in/{ELECTION_URL_PREFIX}/partywiseresult-{state_code}.htm"
+    url = f"{get_election_base_url()}/partywiseresult-{state_code}.htm"
     timestamp = now_timestamp()
     try:
-        response = requests.get(url, headers=HEADERS, timeout=10)
+        response = fetch_url(url, referer=get_index_url())
+        if response is None:
+            return None
         if response.status_code != 200:
             log(f"Partywise {state_code} returned HTTP {response.status_code}: {url}")
             return None
@@ -455,12 +520,14 @@ def fetch_party_wise(state_name: str, state_code: str) -> pd.DataFrame | None:
 
 def fetch_state_trends(state_name: str, state_code: str, page_no: int) -> tuple[list[dict], int | None]:
     """Fetches state trend rows plus discovered pagination size."""
-    url = f"https://results.eci.gov.in/{ELECTION_URL_PREFIX}/statewise{state_code}{page_no}.htm"
+    url = f"{get_election_base_url()}/statewise{state_code}{page_no}.htm"
     timestamp = now_timestamp()
     results = []
     page_count = None
     try:
-        response = requests.get(url, headers=HEADERS, timeout=10)
+        response = fetch_url(url, referer=get_index_url())
+        if response is None:
+            return [], None
         if response.status_code != 200:
             log(f"Statewise {state_code} page {page_no} returned HTTP {response.status_code}: {url}")
             return [], None
@@ -514,10 +581,13 @@ def fetch_constituency_details(
     state_name: str, state_code: str, constituency_no: int, constituency_name: str
 ) -> pd.DataFrame | None:
     """Fetches candidate-wise details for a constituency."""
-    url = f"https://results.eci.gov.in/{ELECTION_URL_PREFIX}/Constituencywise{state_code}{constituency_no}.htm"
+    url = f"{get_election_base_url()}/Constituencywise{state_code}{constituency_no}.htm"
     timestamp = now_timestamp()
     try:
-        response = requests.get(url, headers=HEADERS, timeout=10)
+        statewise_referer = f"{get_election_base_url()}/statewise{state_code}1.htm"
+        response = fetch_url(url, referer=statewise_referer)
+        if response is None:
+            return None
         if response.status_code != 200:
             log(f"Constituency {state_code}-{constituency_no} returned HTTP {response.status_code}: {url}")
             return None
@@ -575,6 +645,7 @@ def save_cache(cache: dict):
 
 def scrape_all():
     log(f"Cycle starting: {datetime.now()}")
+    bootstrap_http_session()
     cache = load_cache()
     state_codes = [config["code"] for config in STATE_CONFIG.values()]
     state_trend_frames_by_state = {}
